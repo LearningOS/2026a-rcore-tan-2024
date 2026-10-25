@@ -133,6 +133,39 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// Record a system call made by the current task.
+    pub fn record_syscall(&self, id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if id < 500 {
+            inner.tasks[current].syscall_counts[id] += 1;
+        }
+    }
+
+    /// Get a system call count for the current task.
+    pub fn syscall_count(&self, id: usize) -> usize {
+        let inner = self.inner.exclusive_access();
+        if id < 500 {
+            inner.tasks[inner.current_task].syscall_counts[id]
+        } else {
+            0
+        }
+    }
+
+    /// Map anonymous pages into the current task.
+    pub fn mmap(&self, start: usize, len: usize, prot: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.mmap(start, len, prot)
+    }
+
+    /// Unmap anonymous pages belonging to the current task.
+    pub fn munmap(&self, start: usize, len: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.munmap(start, len)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +234,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Record a system call invocation.
+pub fn record_syscall(id: usize) {
+    TASK_MANAGER.record_syscall(id);
+}
+
+/// Query a system call invocation count.
+pub fn syscall_count(id: usize) -> usize {
+    TASK_MANAGER.syscall_count(id)
+}
+
+/// Map pages for the current task.
+pub fn mmap_current(start: usize, len: usize, prot: usize) -> isize {
+    TASK_MANAGER.mmap(start, len, prot)
+}
+
+/// Unmap pages for the current task.
+pub fn munmap_current(start: usize, len: usize) -> isize {
+    TASK_MANAGER.munmap(start, len)
 }

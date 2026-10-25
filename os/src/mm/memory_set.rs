@@ -8,7 +8,7 @@ use crate::config::{
     KERNEL_STACK_SIZE, MEMORY_END, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE,
 };
 use crate::sync::UPSafeCell;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -37,6 +37,7 @@ lazy_static! {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    mmap_pages: BTreeSet<VirtPageNum>,
 }
 
 impl MemorySet {
@@ -45,6 +46,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            mmap_pages: BTreeSet::new(),
         }
     }
     /// Get the page table token
@@ -221,6 +223,98 @@ impl MemorySet {
             elf.header.pt2.entry_point() as usize,
         )
     }
+    /// Create anonymous user mappings.
+    pub fn mmap(&mut self, start: usize, len: usize, prot: usize) -> isize {
+        const LIMIT: usize = 1usize << 38;
+
+        if start % PAGE_SIZE != 0 || prot == 0 || prot & !7 != 0 {
+            return -1;
+        }
+
+        let end = match len.checked_add(PAGE_SIZE - 1)
+            .and_then(|n| start.checked_add(n & !(PAGE_SIZE - 1)))
+        {
+            Some(end) if end <= LIMIT => end,
+            _ => return -1,
+        };
+
+        if start >= LIMIT {
+            return -1;
+        }
+
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            if self.page_table.translate(vpn)
+                .map_or(false, |pte| pte.is_valid())
+            {
+                return -1;
+            }
+        }
+
+        let mut permission = MapPermission::U;
+        if prot & 1 != 0 {
+            permission |= MapPermission::R;
+        }
+        if prot & 2 != 0 {
+            // RISC-V does not support a writable, non-readable leaf PTE.
+            permission |= MapPermission::R | MapPermission::W;
+        }
+        if prot & 4 != 0 {
+            permission |= MapPermission::X;
+        }
+
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            self.insert_framed_area(
+                VirtAddr::from(addr),
+                VirtAddr::from(addr + PAGE_SIZE),
+                permission,
+            );
+            self.mmap_pages.insert(vpn);
+        }
+        0
+    }
+
+    /// Remove anonymous user mappings.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        const LIMIT: usize = 1usize << 38;
+
+        if start % PAGE_SIZE != 0 {
+            return -1;
+        }
+
+        let end = match len.checked_add(PAGE_SIZE - 1)
+            .and_then(|n| start.checked_add(n & !(PAGE_SIZE - 1)))
+        {
+            Some(end) if end <= LIMIT => end,
+            _ => return -1,
+        };
+
+        if start >= LIMIT {
+            return -1;
+        }
+
+        // Validate the entire range before changing any mapping.
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            if !self.mmap_pages.contains(&vpn) {
+                return -1;
+            }
+        }
+
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            let index = self.areas.iter().position(|area| {
+                area.vpn_range.get_start() == vpn
+                    && area.vpn_range.get_end().0 == vpn.0 + 1
+            }).unwrap();
+            let mut area = self.areas.remove(index);
+            area.unmap(&mut self.page_table);
+            self.mmap_pages.remove(&vpn);
+        }
+        0
+    }
+
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {
         let satp = self.page_table.token();
