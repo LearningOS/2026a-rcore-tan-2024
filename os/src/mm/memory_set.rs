@@ -34,6 +34,7 @@ lazy_static! {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    mmap_pages: Vec<usize>,
 }
 
 impl MemorySet {
@@ -42,6 +43,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            mmap_pages: Vec::new(),
         }
     }
     /// Get the page table token
@@ -251,6 +253,7 @@ impl MemorySet {
                     .copy_from_slice(src_ppn.get_bytes_array());
             }
         }
+        memory_set.mmap_pages = user_space.mmap_pages.clone();
         memory_set
     }
     /// Change page table by writing satp CSR Register.
@@ -266,9 +269,111 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Map anonymous pages into the current address space.
+    pub fn mmap(&mut self, start: usize, len: usize, prot: usize) -> isize {
+        const USER_TOP: usize = 1usize << 38;
+
+        if start % PAGE_SIZE != 0
+            || start >= USER_TOP
+            || prot & !0x7usize != 0
+            || prot & 0x7 == 0
+        {
+            return -1;
+        }
+
+        if len == 0 {
+            return 0;
+        }
+
+        let rounded_len = match len.checked_add(PAGE_SIZE - 1) {
+            Some(value) => value & !(PAGE_SIZE - 1),
+            None => return -1,
+        };
+        let end = match start.checked_add(rounded_len) {
+            Some(end) if end <= USER_TOP => end,
+            _ => return -1,
+        };
+
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            if self.mmap_pages.contains(&vpn.0)
+                || self.page_table.translate(vpn).map_or(false, |pte| pte.is_valid())
+            {
+                return -1;
+            }
+        }
+
+        let mut permission = MapPermission::U;
+        if prot & 1 != 0 {
+            permission |= MapPermission::R;
+        }
+        if prot & 2 != 0 {
+            permission |= MapPermission::R | MapPermission::W;
+        }
+        if prot & 4 != 0 {
+            permission |= MapPermission::X;
+        }
+
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            self.insert_framed_area(
+                VirtAddr::from(addr),
+                VirtAddr::from(addr + PAGE_SIZE),
+                permission,
+            );
+            self.mmap_pages.push(vpn.0);
+        }
+
+        unsafe {
+            asm!("sfence.vma");
+        }
+        0
+    }
+
+    /// Remove anonymous mappings previously created by mmap.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        const USER_TOP: usize = 1usize << 38;
+
+        if start % PAGE_SIZE != 0 || start >= USER_TOP {
+            return -1;
+        }
+
+        if len == 0 {
+            return 0;
+        }
+
+        let rounded_len = match len.checked_add(PAGE_SIZE - 1) {
+            Some(value) => value & !(PAGE_SIZE - 1),
+            None => return -1,
+        };
+        let end = match start.checked_add(rounded_len) {
+            Some(end) if end <= USER_TOP => end,
+            _ => return -1,
+        };
+
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            if !self.mmap_pages.contains(&vpn.0) {
+                return -1;
+            }
+        }
+
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            self.remove_area_with_start_vpn(vpn);
+            self.mmap_pages.retain(|page| *page != vpn.0);
+        }
+
+        unsafe {
+            asm!("sfence.vma");
+        }
+        0
+    }
+
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
+        self.mmap_pages.clear();
     }
 
     /// shrink the area to new_end

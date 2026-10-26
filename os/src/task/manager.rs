@@ -21,9 +21,34 @@ impl TaskManager {
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
         self.ready_queue.push_back(task);
     }
-    /// Take a process out of the ready queue
+    /// Take the runnable process with the smallest stride.
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+
+        let mut min_index = 0;
+        let mut min_stride =
+            self.ready_queue[0].inner_exclusive_access().stride;
+
+        for index in 1..self.ready_queue.len() {
+            let candidate_stride =
+                self.ready_queue[index].inner_exclusive_access().stride;
+
+            if (candidate_stride.wrapping_sub(min_stride) as i64) < 0 {
+                min_index = index;
+                min_stride = candidate_stride;
+            }
+        }
+
+        let task = self.ready_queue.remove(min_index).unwrap();
+        {
+            const BIG_STRIDE: u64 = 1 << 20;
+            let mut inner = task.inner_exclusive_access();
+            let pass = (BIG_STRIDE / inner.priority as u64).max(1);
+            inner.stride = inner.stride.wrapping_add(pass);
+        }
+        Some(task)
     }
 }
 
