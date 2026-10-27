@@ -1,6 +1,9 @@
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
+    mm::{
+        translated_byte_buffer, translated_ref, translated_refmut, translated_str, PageTable,
+        VirtAddr,
+    },
     task::{
         current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
         suspend_current_and_run_next, SignalFlags,
@@ -148,15 +151,34 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 
 /// get_time syscall
 ///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
-    );
-    -1
+/// Write both fields through user page translations, including split-page values.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let start = ts as usize;
+    let end = match start.checked_add(core::mem::size_of::<TimeVal>()) {
+        Some(end) if end <= 1usize << 38 => end,
+        _ => return -1,
+    };
+    let token = current_user_token();
+    let table = PageTable::from_token(token);
+    for addr in [start, end - 1] {
+        match table.translate(VirtAddr::from(addr).floor()) {
+            Some(pte) if pte.is_valid() && pte.writable() && pte.flags().bits() & (1 << 4) != 0 => {
+            }
+            _ => return -1,
+        }
+    }
+    let us = crate::timer::get_time_us();
+    let mut bytes = [0; core::mem::size_of::<TimeVal>()];
+    let word = core::mem::size_of::<usize>();
+    bytes[..word].copy_from_slice(&(us / 1_000_000).to_ne_bytes());
+    bytes[word..].copy_from_slice(&(us % 1_000_000).to_ne_bytes());
+    let mut offset = 0;
+    for buffer in translated_byte_buffer(token, ts as *const u8, bytes.len()) {
+        let end = offset + buffer.len();
+        buffer.copy_from_slice(&bytes[offset..end]);
+        offset = end;
+    }
+    0
 }
 
 /// mmap syscall

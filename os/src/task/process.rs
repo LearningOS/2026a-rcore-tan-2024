@@ -7,6 +7,7 @@ use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
+use crate::sync::ResourceTracker;
 use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
@@ -49,6 +50,10 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// Whether resource acquisition should reject detected deadlocks.
+    pub deadlock_detect_enabled: bool,
+    pub(crate) mutex_resources: ResourceTracker,
+    pub(crate) semaphore_resources: ResourceTracker,
 }
 
 impl ProcessControlBlockInner {
@@ -72,6 +77,8 @@ impl ProcessControlBlockInner {
     }
     /// deallocate a task id
     pub fn dealloc_tid(&mut self, tid: usize) {
+        self.mutex_resources.remove_thread(tid);
+        self.semaphore_resources.remove_thread(tid);
         self.task_res_allocator.dealloc(tid)
     }
     /// the count of tasks(threads) in this process
@@ -119,6 +126,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect_enabled: false,
+                    mutex_resources: ResourceTracker::new(),
+                    semaphore_resources: ResourceTracker::new(),
                 })
             },
         });
@@ -161,7 +171,16 @@ impl ProcessControlBlock {
         let new_token = memory_set.token();
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
-        self.inner_exclusive_access().memory_set = memory_set;
+        {
+            let mut inner = self.inner_exclusive_access();
+            inner.memory_set = memory_set;
+            inner.mutex_list.clear();
+            inner.semaphore_list.clear();
+            inner.condvar_list.clear();
+            inner.deadlock_detect_enabled = false;
+            inner.mutex_resources = ResourceTracker::new();
+            inner.semaphore_resources = ResourceTracker::new();
+        }
         // then we alloc user resource for main thread again
         // since memory_set has been changed
         trace!("kernel: exec .. alloc user resource for main thread again");
@@ -245,6 +264,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect_enabled: false,
+                    mutex_resources: ResourceTracker::new(),
+                    semaphore_resources: ResourceTracker::new(),
                 })
             },
         });
