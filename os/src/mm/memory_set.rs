@@ -40,6 +40,7 @@ pub fn kernel_token() -> usize {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    mmap_pages: Vec<VirtPageNum>,
 }
 
 impl MemorySet {
@@ -48,6 +49,7 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            mmap_pages: Vec::new(),
         }
     }
     /// Get the page table token
@@ -203,7 +205,7 @@ impl MemorySet {
                     map_perm |= MapPermission::X;
                 }
                 let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
-                max_end_vpn = map_area.vpn_range.get_end();
+                max_end_vpn = max_end_vpn.max(map_area.vpn_range.get_end());
                 memory_set.push(
                     map_area,
                     Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
@@ -251,9 +253,63 @@ impl MemorySet {
             elf.header.pt2.entry_point() as usize,
         )
     }
+    /// Check executable headers before passing filesystem bytes to the loader.
+    pub fn valid_elf(data: &[u8]) -> bool {
+        // The current loader accepts little-endian ELF64 RISC-V executables.
+        if data.len() < 64 || data[4..6] != [2, 1] || data[18..20] != [243, 0] {
+            return false;
+        }
+        let elf = match xmas_elf::ElfFile::new(data) {
+            Ok(elf) => elf,
+            Err(_) => return false,
+        };
+        let headers = elf.header.pt2;
+        if headers.ph_entry_size() != 56
+            || headers.ph_offset() % 8 != 0
+            || headers
+                .ph_offset()
+                .checked_add(headers.ph_count() as u64 * 56)
+                .map_or(true, |end| end > data.len() as u64)
+        {
+            return false;
+        }
+        let mut ranges = Vec::new();
+        let mut entry_mapped = false;
+        for ph in elf.program_iter() {
+            match ph.get_type() {
+                Ok(xmas_elf::program::Type::Load) => {}
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+            let start = ph.virtual_addr() as usize;
+            let end = match start.checked_add(ph.mem_size() as usize) {
+                Some(end) if end < (1usize << 38) - PAGE_SIZE * 2 - USER_STACK_SIZE => end,
+                _ => return false,
+            };
+            if start % PAGE_SIZE != 0
+                || ph.mem_size() == 0
+                || ph.file_size() > ph.mem_size()
+                || ph
+                    .offset()
+                    .checked_add(ph.file_size())
+                    .map_or(true, |end| end > data.len() as u64)
+            {
+                return false;
+            }
+            let pages = (VirtAddr::from(start).floor(), VirtAddr::from(end).ceil());
+            if ranges.iter().any(|&(lo, hi)| pages.0 < hi && lo < pages.1) {
+                return false;
+            }
+            ranges.push(pages);
+            let entry = elf.header.pt2.entry_point() as usize;
+            entry_mapped |= ph.flags().is_execute() && start <= entry && entry < end;
+        }
+        entry_mapped
+    }
     /// Create a new address space by copy code&data from a exited process's address space.
     pub fn from_existed_user(user_space: &Self) -> Self {
         let mut memory_set = Self::new_bare();
+        memory_set.mmap_pages = user_space.mmap_pages.clone();
         // map trampoline
         memory_set.map_trampoline();
         // copy data sections/trap_context/user_stack
@@ -284,9 +340,75 @@ impl MemorySet {
         self.page_table.translate(vpn)
     }
 
+    /// Map anonymous user pages after validating the entire range.
+    pub fn mmap(&mut self, start: usize, len: usize, prot: usize) -> isize {
+        if start % PAGE_SIZE != 0 || start >= 1usize << 38 || prot & !7 != 0 || prot & 7 == 0 {
+            return -1;
+        }
+        let end = match len
+            .checked_add(PAGE_SIZE - 1)
+            .and_then(|n| start.checked_add(n & !(PAGE_SIZE - 1)))
+        {
+            Some(end) if end <= 1usize << 38 => end,
+            _ => return -1,
+        };
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            if self.translate(VirtAddr::from(addr).floor()).is_some() {
+                return -1;
+            }
+        }
+        let mut permission = MapPermission::U;
+        if prot & 1 != 0 {
+            permission |= MapPermission::R;
+        }
+        if prot & 2 != 0 {
+            permission |= MapPermission::W;
+        }
+        if prot & 4 != 0 {
+            permission |= MapPermission::X;
+        }
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            self.insert_framed_area(addr.into(), (addr + PAGE_SIZE).into(), permission);
+            self.mmap_pages.push(VirtAddr::from(addr).floor());
+        }
+        unsafe {
+            asm!("sfence.vma");
+        }
+        0
+    }
+
+    /// Unmap only anonymous pages, validating before changing any mapping.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        if start % PAGE_SIZE != 0 || start >= 1usize << 38 {
+            return -1;
+        }
+        let end = match len
+            .checked_add(PAGE_SIZE - 1)
+            .and_then(|n| start.checked_add(n & !(PAGE_SIZE - 1)))
+        {
+            Some(end) if end <= 1usize << 38 => end,
+            _ => return -1,
+        };
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            if !self.mmap_pages.contains(&VirtAddr::from(addr).floor()) {
+                return -1;
+            }
+        }
+        for addr in (start..end).step_by(PAGE_SIZE) {
+            let vpn = VirtAddr::from(addr).floor();
+            self.remove_area_with_start_vpn(vpn);
+            self.mmap_pages.retain(|page| *page != vpn);
+        }
+        unsafe {
+            asm!("sfence.vma");
+        }
+        0
+    }
+
     ///Remove all `MapArea`
     pub fn recycle_data_pages(&mut self) {
         self.areas.clear();
+        self.mmap_pages.clear();
     }
 
     /// shrink the area to new_end

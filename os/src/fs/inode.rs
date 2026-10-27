@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -53,6 +53,24 @@ impl OSInode {
         }
         v
     }
+
+    fn get_stat(&self) -> Stat {
+        let inode = self.inner.exclusive_access().inode.clone();
+        let inode_id = inode.inode_id();
+        let mode = if inode.is_dir() {
+            StatMode::DIR
+        } else {
+            StatMode::FILE
+        };
+
+        Stat {
+            dev: 0,
+            ino: inode_id as u64,
+            mode,
+            nlink: ROOT_INODE.count_links(inode_id),
+            pad: [0; 7],
+        }
+    }
 }
 
 lazy_static! {
@@ -88,26 +106,32 @@ bitflags! {
 }
 
 impl OpenFlags {
-    /// Do not check validity for simplicity
     /// Return (readable, writable)
     pub fn read_write(&self) -> (bool, bool) {
-        if self.is_empty() {
-            (true, false)
-        } else if self.contains(Self::WRONLY) {
+        if self.contains(Self::WRONLY) {
             (false, true)
-        } else {
+        } else if self.contains(Self::RDWR) {
             (true, true)
+        } else {
+            (true, false)
         }
     }
 }
 
 /// Open a file
 pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
+    if flags.contains(OpenFlags::WRONLY | OpenFlags::RDWR) {
+        return None;
+    }
     let (readable, writable) = flags.read_write();
     if flags.contains(OpenFlags::CREATE) {
         if let Some(inode) = ROOT_INODE.find(name) {
-            // clear size
-            inode.clear();
+            if inode.is_dir() {
+                return None;
+            }
+            if flags.contains(OpenFlags::TRUNC) {
+                inode.clear();
+            }
             Some(Arc::new(OSInode::new(readable, writable, inode)))
         } else {
             // create file
@@ -116,13 +140,42 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
                 .map(|inode| Arc::new(OSInode::new(readable, writable, inode)))
         }
     } else {
-        ROOT_INODE.find(name).map(|inode| {
-            if flags.contains(OpenFlags::TRUNC) {
-                inode.clear();
-            }
-            Arc::new(OSInode::new(readable, writable, inode))
-        })
+        ROOT_INODE
+            .find(name)
+            .filter(|inode| !inode.is_dir())
+            .map(|inode| {
+                if flags.contains(OpenFlags::TRUNC) {
+                    inode.clear();
+                }
+                Arc::new(OSInode::new(readable, writable, inode))
+            })
     }
+}
+
+/// Create a hard link to an existing file.
+pub fn link_file(old_name: &str, new_name: &str) -> bool {
+    if old_name.is_empty()
+        || new_name.is_empty()
+        || old_name.contains('/')
+        || new_name.contains('/')
+    {
+        return false;
+    }
+
+    let target = match ROOT_INODE.find(old_name) {
+        Some(inode) => inode,
+        None => return false,
+    };
+
+    ROOT_INODE.link(new_name, target.as_ref())
+}
+
+/// Remove a file name from the root directory.
+pub fn unlink_file(name: &str) -> bool {
+    if name.is_empty() || name.contains('/') {
+        return false;
+    }
+    ROOT_INODE.unlink(name)
 }
 
 impl File for OSInode {
@@ -131,6 +184,9 @@ impl File for OSInode {
     }
     fn writable(&self) -> bool {
         self.writable
+    }
+    fn stat(&self) -> Option<Stat> {
+        Some(self.get_stat())
     }
     fn read(&self, mut buf: UserBuffer) -> usize {
         let mut inner = self.inner.exclusive_access();
@@ -150,9 +206,11 @@ impl File for OSInode {
         let mut total_write_size = 0usize;
         for slice in buf.buffers.iter() {
             let write_size = inner.inode.write_at(inner.offset, *slice);
-            assert_eq!(write_size, slice.len());
             inner.offset += write_size;
             total_write_size += write_size;
+            if write_size < slice.len() {
+                break;
+            }
         }
         total_write_size
     }

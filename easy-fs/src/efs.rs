@@ -3,7 +3,8 @@ use super::{
     SuperBlock,
 };
 use crate::BLOCK_SZ;
-use alloc::sync::Arc;
+use alloc::collections::BTreeMap;
+use alloc::sync::{Arc, Weak};
 use spin::Mutex;
 ///An easy file system on block
 pub struct EasyFileSystem {
@@ -15,6 +16,9 @@ pub struct EasyFileSystem {
     pub data_bitmap: Bitmap,
     inode_area_start_block: u32,
     data_area_start_block: u32,
+    data_area_blocks: u32,
+    /// Canonical live handles keep an unlinked file alive until its last user closes it.
+    inodes: BTreeMap<u32, Weak<Inode>>,
 }
 
 type DataBlock = [u8; BLOCK_SZ];
@@ -45,6 +49,8 @@ impl EasyFileSystem {
             data_bitmap,
             inode_area_start_block: 1 + inode_bitmap_blocks,
             data_area_start_block: 1 + inode_total_blocks + data_bitmap_blocks,
+            data_area_blocks,
+            inodes: BTreeMap::new(),
         };
         // clear all blocks
         for i in 0..total_blocks {
@@ -99,6 +105,8 @@ impl EasyFileSystem {
                     ),
                     inode_area_start_block: 1 + super_block.inode_bitmap_blocks,
                     data_area_start_block: 1 + inode_total_blocks + super_block.data_bitmap_blocks,
+                    data_area_blocks: super_block.data_area_blocks,
+                    inodes: BTreeMap::new(),
                 };
                 Arc::new(Mutex::new(efs))
             })
@@ -121,18 +129,62 @@ impl EasyFileSystem {
             (inode_id % inodes_per_block) as usize * inode_size,
         )
     }
+    /// Get the inode number from its disk location.
+    pub fn get_inode_id(&self, block_id: u32, block_offset: usize) -> u32 {
+        let inode_size = core::mem::size_of::<DiskInode>();
+        let inodes_per_block = (BLOCK_SZ / inode_size) as u32;
+        (block_id - self.inode_area_start_block) * inodes_per_block
+            + (block_offset / inode_size) as u32
+    }
+    /// Return the unique live handle for a file inode. Caller holds the filesystem lock.
+    pub(crate) fn get_inode(&mut self, id: u32, fs: &Arc<Mutex<Self>>) -> Arc<Inode> {
+        if let Some(inode) = self.inodes.get(&id).and_then(Weak::upgrade) {
+            return inode;
+        }
+        let (block, offset) = self.get_disk_inode_pos(id);
+        let inode = Arc::new(Inode::new(
+            block,
+            offset,
+            fs.clone(),
+            self.block_device.clone(),
+        ));
+        self.inodes.insert(id, Arc::downgrade(&inode));
+        inode
+    }
     /// Get data block by id
     pub fn get_data_block_id(&self, data_block_id: u32) -> u32 {
         self.data_area_start_block + data_block_id
     }
     /// Allocate a new inode
     pub fn alloc_inode(&mut self) -> u32 {
-        self.inode_bitmap.alloc(&self.block_device).unwrap() as u32
+        self.try_alloc_inode().unwrap()
+    }
+    /// Allocate an inode, returning None when the bitmap is full.
+    pub fn try_alloc_inode(&mut self) -> Option<u32> {
+        self.inode_bitmap
+            .alloc(&self.block_device)
+            .map(|id| id as u32)
     }
 
+    /// Release an inode number.
+    pub fn dealloc_inode(&mut self, inode_id: u32) {
+        assert_ne!(inode_id, 0);
+        self.inodes.remove(&inode_id);
+        self.inode_bitmap
+            .dealloc(&self.block_device, inode_id as usize);
+    }
     /// Allocate a data block
     pub fn alloc_data(&mut self) -> u32 {
-        self.data_bitmap.alloc(&self.block_device).unwrap() as u32 + self.data_area_start_block
+        self.try_alloc_data().unwrap()
+    }
+    /// Allocate a real data block, excluding bitmap padding beyond the device.
+    pub fn try_alloc_data(&mut self) -> Option<u32> {
+        let id = self.data_bitmap.alloc(&self.block_device)?;
+        if id >= self.data_area_blocks as usize {
+            self.data_bitmap.dealloc(&self.block_device, id);
+            return None;
+        }
+        Some(id as u32 + self.data_area_start_block)
     }
     /// Deallocate a data block
     pub fn dealloc_data(&mut self, block_id: u32) {

@@ -18,7 +18,9 @@ impl File for Stdin {
         false
     }
     fn read(&self, mut user_buf: UserBuffer) -> usize {
-        assert_eq!(user_buf.len(), 1);
+        if user_buf.len() == 0 {
+            return 0;
+        }
         // busy loop
         let mut c: usize;
         loop {
@@ -53,7 +55,9 @@ impl File for Stdout {
     }
     fn write(&self, user_buf: UserBuffer) -> usize {
         for buffer in user_buf.buffers.iter() {
-            print!("{}", core::str::from_utf8(*buffer).unwrap());
+            for byte in buffer.iter() {
+                crate::sbi::console_putchar(*byte as usize);
+            }
         }
         user_buf.len()
     }

@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{checked_str, copy_to_user},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
         suspend_current_and_run_next,
@@ -53,9 +53,15 @@ pub fn sys_fork() -> isize {
 pub fn sys_exec(path: *const u8) -> isize {
     trace!("kernel:pid[{}] sys_exec", current_task().unwrap().pid.0);
     let token = current_user_token();
-    let path = translated_str(token, path);
+    let path = match checked_str(token, path) {
+        Some(path) => path,
+        None => return -1,
+    };
     if let Some(app_inode) = open_file(path.as_str(), OpenFlags::RDONLY) {
         let all_data = app_inode.read_all();
+        if !crate::mm::MemorySet::valid_elf(&all_data) {
+            return -1;
+        }
         let task = current_task().unwrap();
         task.exec(all_data.as_slice());
         0
@@ -87,14 +93,20 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
         // ++++ release child PCB
     });
     if let Some((idx, _)) = pair {
+        let exit_code = inner.children[idx].inner_exclusive_access().exit_code;
+        if copy_to_user(
+            inner.memory_set.token(),
+            exit_code_ptr as *mut u8,
+            &exit_code.to_ne_bytes(),
+        )
+        .is_none()
+        {
+            return -1;
+        }
         let child = inner.children.remove(idx);
         // confirm that child will be deallocated after being removed from children list
         assert_eq!(Arc::strong_count(&child), 1);
         let found_pid = child.getpid();
-        // ++++ temporarily access child PCB exclusively
-        let exit_code = child.inner_exclusive_access().exit_code;
-        // ++++ release child PCB
-        *translated_refmut(inner.memory_set.token(), exit_code_ptr) = exit_code;
         found_pid as isize
     } else {
         -2
@@ -102,33 +114,34 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Write time through the user page table, including split-page TimeVal values.
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    let us = crate::timer::get_time_us();
+    let mut bytes = [0; core::mem::size_of::<TimeVal>()];
+    let word = core::mem::size_of::<usize>();
+    bytes[..word].copy_from_slice(&(us / 1_000_000).to_ne_bytes());
+    bytes[word..].copy_from_slice(&(us % 1_000_000).to_ne_bytes());
+    if copy_to_user(current_user_token(), ts as *mut u8, &bytes).is_some() {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .memory_set
+        .mmap(start, len, prot)
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .memory_set
+        .munmap(start, len)
 }
 
 /// change data segment size
@@ -141,21 +154,37 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// Load a fresh child address space directly from the filesystem.
+pub fn sys_spawn(path: *const u8) -> isize {
+    let path = match checked_str(current_user_token(), path) {
+        Some(path) => path,
+        None => return -1,
+    };
+    let inode = match open_file(&path, OpenFlags::RDONLY) {
+        Some(inode) => inode,
+        None => return -1,
+    };
+    let data = inode.read_all();
+    if !crate::mm::MemorySet::valid_elf(&data) {
+        return -1;
+    }
+    let parent = current_task().unwrap();
+    let child = Arc::new(crate::task::TaskControlBlock::new(&data));
+    {
+        let mut inner = child.inner_exclusive_access();
+        inner.parent = Some(Arc::downgrade(&parent));
+        inner.stride = parent.inner_exclusive_access().stride;
+    }
+    let pid = child.getpid();
+    parent.inner_exclusive_access().children.push(child.clone());
+    add_task(child);
+    pid as isize
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_set_priority(prio: isize) -> isize {
+    if prio < 2 {
+        return -1;
+    }
+    current_task().unwrap().inner_exclusive_access().priority = prio as usize;
+    prio
 }

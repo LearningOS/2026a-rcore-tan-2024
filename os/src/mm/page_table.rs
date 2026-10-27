@@ -141,11 +141,13 @@ impl PageTable {
     }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
-        self.find_pte(vpn).map(|pte| *pte)
+        self.find_pte(vpn)
+            .filter(|pte| pte.is_valid())
+            .map(|pte| *pte)
     }
     /// get the physical address from the virtual address
     pub fn translate_va(&self, va: VirtAddr) -> Option<PhysAddr> {
-        self.find_pte(va.clone().floor()).map(|pte| {
+        self.translate(va.floor()).map(|pte| {
             let aligned_pa: PhysAddr = pte.ppn().into();
             let offset = va.page_offset();
             let aligned_pa_usize: usize = aligned_pa.into();
@@ -156,6 +158,59 @@ impl PageTable {
     pub fn token(&self) -> usize {
         8usize << 60 | self.root_ppn.0
     }
+}
+
+/// Validate a complete user range before exposing any of its physical pages.
+pub fn checked_byte_buffer(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    write: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    let start = ptr as usize;
+    let end = start.checked_add(len)?;
+    if start >= (1usize << 38) || end > (1usize << 38) {
+        return None;
+    }
+    let table = PageTable::from_token(token);
+    let required = PTEFlags::U | if write { PTEFlags::W } else { PTEFlags::R };
+    let mut addr = start;
+    while addr < end {
+        let va = VirtAddr::from(addr);
+        let pte = table.translate(va.floor())?;
+        if !pte.flags().contains(required) {
+            return None;
+        }
+        addr += (crate::config::PAGE_SIZE - va.page_offset()).min(end - addr);
+    }
+    Some(translated_byte_buffer(token, ptr, len))
+}
+
+/// Copy bytes to userspace, including values crossing a page boundary.
+pub fn copy_to_user(token: usize, ptr: *mut u8, data: &[u8]) -> Option<()> {
+    let buffers = checked_byte_buffer(token, ptr, data.len(), true)?;
+    let mut offset = 0;
+    for buffer in buffers {
+        let end = offset + buffer.len();
+        buffer.copy_from_slice(&data[offset..end]);
+        offset = end;
+    }
+    Some(())
+}
+
+/// Read a bounded, NUL-terminated UTF-8 path from readable user pages.
+pub fn checked_str(token: usize, ptr: *const u8) -> Option<String> {
+    let mut bytes = Vec::new();
+    for offset in 0..=27 {
+        let addr = (ptr as usize).checked_add(offset)?;
+        let buffers = checked_byte_buffer(token, addr as *const u8, 1, false)?;
+        let byte = buffers[0][0];
+        if byte == 0 {
+            return String::from_utf8(bytes).ok();
+        }
+        bytes.push(byte);
+    }
+    None
 }
 
 /// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table
